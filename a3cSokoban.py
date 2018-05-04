@@ -13,6 +13,7 @@ from ctypes import c_float
 from ctypes import c_int32
 from ctypes import cdll
 from collections import deque
+import csv
 myLib=np.ctypeslib.load_library('libsokoban', '/home/wf/CLionProjects/sokoban/cmake-build-release/')
 GameNew=myLib.py_sokoban
 GameMov=myLib.py_move
@@ -32,6 +33,48 @@ GameBMov.argtypes=[pfloat,pfloat,pfloat,pint,pfloat,c_int32]
 gridSz = 8
 YEX=20
 batchSz = 16
+
+exp3Min=15
+exp3Max=85
+exp3arm=exp3Max-exp3Min
+exp3T=100000
+exp3gamma=(1.0/exp3T)**(0.5)
+exp3eta=2*exp3gamma
+
+class exp3():
+    def __init__(self):
+        self.p = np.zeros(exp3arm, dtype="float64")
+        self.q = np.zeros(exp3arm, dtype="float64")
+        self.c = np.zeros(exp3arm, dtype="float64")
+        self.r = np.zeros(exp3arm, dtype="float64")
+        self.t=0
+        self.p[exp3arm - 1] = 1
+    def updateP(self,maxmove,reward,cost):
+        self.t += 1
+        if self.t > exp3T:
+            self.q = np.zeros(exp3arm, dtype="float64")
+            self.c = np.zeros(exp3arm, dtype="float64")
+            self.r = np.zeros(exp3arm, dtype="float64")
+            self.t = 0
+        arm=maxmove-exp3Min
+        for i in range(max(0,cost-exp3Min),arm+1):
+            self.r[i]+=reward/np.sum(self.p[i:])
+        for i in range(arm+1):
+            self.c[i] += min(cost,i+exp3Min) / np.sum(self.p[i:])
+
+        self.q= self.r / (self.c+0.00000001) * self.t
+
+        qmin=np.amin(self.q)
+        self.q-=qmin
+        qexp=np.exp(self.q*exp3eta)
+        self.p=(1-exp3gamma)*qexp/qexp.sum()
+        self.p[exp3arm-1]+=exp3gamma
+
+    def drawArm(self):
+
+        return exp3Min+np.random.choice(exp3arm,p=self.p)
+
+
 
 bindata=0
 numBox=4
@@ -80,11 +123,15 @@ class sokobanGame():
         self.valiMov = np.zeros((batchSz,4), dtype="float32")
         self.curScore = np.zeros(batchSz, dtype="float32")
         self.statefinish = np.ones((batchSz), dtype="float32")
-        self.move=np.zeros((batchSz), dtype="float32")
+        self.move=np.zeros((batchSz), dtype="int32")
+        self.gameidx=np.zeros((batchSz), dtype="int32")
         self.numBox=numBox
         self.newgameidx=0
-
-
+        self.bandit=exp3()
+        self.maxmove=np.zeros((batchSz), dtype="int32")
+        self.istest=np.zeros((batchSz), dtype="int32")
+        totalLvl = np.shape(bindata)[0]
+        self.lvlFailRate = np.ones(totalLvl, dtype="float32")
     def new_episode(self):
         totalLvl = np.shape(bindata)[0]
         for i in range(batchSz):
@@ -98,8 +145,16 @@ class sokobanGame():
                     self.state[i, boxPos * 4 + 1] = 1
                     boxGoal=bindata[self.newgameidx,73+b]
                     self.state[i, boxGoal * 4 + 2] = 1
+                self.gameidx[i] = self.newgameidx
                 self.newgameidx=(self.newgameidx+1)%totalLvl
                 self.move[i]=0
+                if np.random.random_sample() < 0.01:
+                    self.istest[i]=1
+                    self.maxmove[i] = 50
+                else:
+                    self.istest[i] = 0
+                    self.maxmove[i]=self.bandit.drawArm()
+
         #py_newgame_batch(float * outbuff, float * validA, float* rightbox,float * updateTag, int  batchSize, int  numBox)
         GameBNew(self.state,self.valiMov,self.curScore,self.statefinish,batchSz,4);
         for i in range(batchSz):
@@ -119,8 +174,16 @@ class sokobanGame():
             if self.curScore[i]==self.numBox:
                 reward[i]=10
                 self.statefinish[i]=1
-            if self.move[i] >= 50:
+            if self.move[i] >= self.maxmove[i]:
                 self.statefinish[i] = 1
+            if(self.statefinish[i]==1):
+                jobdone=1 if self.curScore[i]==self.numBox else 0
+                if self.istest[i]==0:
+                    self.bandit.updateP(self.maxmove[i],jobdone*self.lvlFailRate[self.gameidx[i]]*self.move[i],self.move[i])
+                with open(r'/home/wf/paper/15_85_05.csv', 'a') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([self.gameidx[i],self.move[i],self.maxmove[i],self.istest[i],jobdone])
+                self.lvlFailRate[self.gameidx[i]] = self.lvlFailRate[self.gameidx[i]] * 0.5 + (1 - jobdone) * 0.5
         return reward
 
 #different from doom setting this game is pure MDP that need no LSTM
@@ -332,6 +395,14 @@ with tf.device("/cpu:0"):
     num_workers = multiprocessing.cpu_count() # Set workers to number of available CPU threads
     num_workers=1
     workers = []
+
+    allfile = os.listdir('/home/wf/sokoban4box/')
+    bindata = []
+    for f in allfile:
+        bindata.append(np.fromfile('/home/wf/sokoban4box/' + f, dtype="int8"))
+
+    bindata = np.hstack(bindata).reshape(-1, 80)
+
     # Create worker classes
     for i in range(num_workers):
         workers.append(Worker(sokobanGame() ,i ,s_size ,a_size ,trainer ,model_path ,global_episodes))
@@ -347,12 +418,6 @@ with tf.Session() as sess:
     else:
         sess.run(tf.global_variables_initializer())
 
-    allfile=os.listdir('/home/wf/sokoban4box/')
-    bindata=[]
-    for f in allfile:
-        bindata.append(np.fromfile('/home/wf/sokoban4box/'+f,dtype="int8"))
-
-    bindata=np.hstack(bindata).reshape(-1,80)
 
 
 
